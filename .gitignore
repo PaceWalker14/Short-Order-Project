@@ -1,0 +1,8 @@
+# The course download contains the local engine, profiles, SDK, assets, and
+# tooling, but the scheduler project tracks only its public description and
+# the one-file submission.
+*
+!.gitignore
+!README.md
+!my-scheduler/
+!my-scheduler/scheduler.py
