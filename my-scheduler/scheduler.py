@@ -1,8 +1,8 @@
-"""Scores every ready order on three things at once and dispatches the best:
-the next burst length (SJF), the total work left (SRTF), and how much slack the
-customer has before they walk (EDF). Each is squashed onto [0, 1) so they can be
-added, and the lowest total gets the next free cook. Orders that cannot be
-finished before their deadline go to the back. Nothing is ever preempted.
+"""Scores every ready order on four things and dispatches the best: next burst
+length (SJF), total work left (SRTF), slack before the customer walks (EDF), and
+whether its next step lands on a station with no place free. Lowest total gets
+the next free cook, and orders that cannot be finished in time go to the back.
+With no ovens to wake us it slices instead, so nobody waits unlooked-at.
 """
 
 from kitchen import Decision, Scheduler, fill_idle
@@ -17,11 +17,12 @@ def _saturate(value, scale):
 
 class MiseEnPlace(Scheduler):
     name = "mise_en_place"
-    version = "2"
+    version = "4"
 
     W_BURST = 0.45          # shortest job first
     W_REMAINING = 0.30      # shortest remaining time first
     W_SLACK = 0.25          # earliest deadline first
+    W_BUMP = 0.20           # penalty for a next step at a full station
 
     # Half-way point of each term, in ticks: roughly the median of the thing
     # being measured, so a typical order sits in the middle of the curve.
@@ -29,9 +30,19 @@ class MiseEnPlace(Scheduler):
     K_REMAINING = 20.0
     K_SLACK = 60.0
 
+    # Only read the next station when the step in hand is this close to done;
+    # any further out and it will have turned over before we get there.
+    BUMP_HORIZON = 4.0
+
     # Big enough to put the hopeless orders behind every servable one without
     # losing their order among themselves.
     DOOMED_COST = 10.0
+
+    # Slicing, for kitchens that will not call us back on their own. A slice is
+    # one tick: it exists only to get a first tick of work onto every order, and
+    # nothing is gained by making it longer. 0 turns slicing off.
+    ROTATE_QUANTUM = 1
+    ROTATE_MIN_BURST = 12
 
     def reset(self, seed):
         self._wait_means = {}
@@ -86,10 +97,30 @@ class MiseEnPlace(Scheduler):
             return obs.estimate_remaining(order)
         return float(burst)
 
+    def _bump_risk(self, obs, order):
+        """1.0 when this order is about to finish its step and move to a station
+        with no place free. That sends it back to the rail and costs a second
+        switch to pick it up again."""
+        nxt = order.step + 1
+        if nxt >= len(order.steps):
+            return 0.0
+        name = order.steps[nxt].station
+        if name is None:
+            return 0.0                      # the oven needs no place
+        step = order.current_step
+        if step is None or step.remaining is None:
+            return 0.0
+        if step.remaining > self.BUMP_HORIZON:
+            return 0.0
+        station = obs.station(name)
+        if station is None:
+            return 0.0
+        return 0.0 if station.free > 0 else 1.0
+
     # -- the composite cost -------------------------------------------------
 
     def _cost(self, obs, order, switch_cost):
-        """Three costs in [0, 1), added by weight. Lowest wins."""
+        """Four costs in [0, 1), added by weight. Lowest wins."""
         burst = self._burst(obs, order)
         remaining = obs.estimate_remaining(order)
         span = self._remaining_span(obs, order)
@@ -103,10 +134,84 @@ class MiseEnPlace(Scheduler):
             self.W_BURST * _saturate(burst, self.K_BURST)
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
             + self.W_SLACK * _saturate(slack, self.K_SLACK)
+            + self.W_BUMP * self._bump_risk(obs, order)
         )
         if doomed:
             cost += self.DOOMED_COST
         return cost, doomed
+
+    # -- rotation -----------------------------------------------------------
+
+    def _event_starved(self, obs):
+        """Whether anything will call us back on its own. No dish in an oven and
+        none due to go in one means the engine has nothing to report until
+        something finishes, so an alarm is the only way to be asked again.
+
+        The menu settles it first: one oven step anywhere on it and this kitchen
+        hands out free wake-ups all service, even if nothing happens to be in an
+        oven this instant."""
+        for recipe in obs.recipes.values():
+            for _, kind, _ in recipe.steps:
+                if kind == "wait":
+                    return False
+        for order in obs.orders:
+            if order.is_blocked:
+                return False
+            for step in order.steps_left:
+                if step.is_wait:
+                    return False
+        return True
+
+    def _should_rotate(self, obs, rail):
+        """Whether to hand out slices instead of running orders to completion.
+
+        Only once the door has been shut a while, and only when a slice is short
+        next to the jobs on the rail - with a one-tick espresso waiting, slicing
+        changes nobody's turn and just spends switches."""
+        if self.ROTATE_QUANTUM <= 0 or len(rail) <= len(obs.cores):
+            return False
+        # Only the orders nobody has looked at yet. Judging this on the whole
+        # rail switches rotation off the moment it starts, because the order it
+        # just preempted comes back part-done and short.
+        waiting = [order for order in rail if not order.has_started]
+        if not waiting:
+            return False
+        floor = self.ROTATE_MIN_BURST + obs.kitchen.switch_cost
+        return min(self._burst(obs, order) for order in waiting) > floor
+
+    def _rotate(self, obs, decision, rail):
+        """Give each cook that has had its slice the next never-started order.
+
+        Response is measured at the first tick of work, so one sweep across the
+        rail banks it - after that everybody has been looked at and the cooks
+        run their orders out."""
+        unstarted = [o for o in rail if not o.has_started]
+        started = [o for o in rail if o.has_started]
+        free = obs.free_stations()
+        for core in obs.cores:
+            current = obs.order_on(core)
+            if current is not None and core.running_for < self.ROTATE_QUANTUM:
+                continue                    # mid-slice, leave it alone
+            if unstarted:
+                queue = unstarted
+            elif current is None:
+                queue = started             # idle cook, nobody new to look at
+            else:
+                continue                    # sweep done; let it run out
+            if core.station:
+                free[core.station] = free.get(core.station, 0) + 1
+            for index, order in enumerate(queue):
+                station = order.station
+                if station is not None and free.get(station, 0) <= 0:
+                    continue
+                decision.assign(core, order)
+                if station is not None:
+                    free[station] -= 1
+                queue.pop(index)
+                break
+            else:
+                if core.station:
+                    free[core.station] -= 1  # took nothing; keeps its place
 
     # -- the decision -------------------------------------------------------
 
@@ -126,12 +231,22 @@ class MiseEnPlace(Scheduler):
         rail = [row[2] for row in scored]
 
         decision = Decision()
-        # Walks the rail in order, skipping anything whose station is full and
-        # counting places as it spends them.
-        fill_idle(decision, obs, rail)
+        starved = bool(rail) and self._event_starved(obs)
+        rotating = starved and self._should_rotate(obs, rail)
+        if rotating:
+            self._rotate(obs, decision, rail)
+        else:
+            # Walks the rail in order, skipping anything whose station is full
+            # and counting places as it spends them.
+            fill_idle(decision, obs, rail)
+        if starved and any(not order.has_started for order in rail):
+            # Nothing else is going to ask us, and somebody has not been looked
+            # at yet - so set the alarm even if it is too early to slice.
+            decision.wake_in(self.ROTATE_QUANTUM)
 
+        note = "slicing" if rotating else "running out"
         return decision.annotate(
-            text=f"{len(rail)} on the rail, {len(doomed_ids)} past saving",
+            text=f"{len(rail)} on the rail, {len(doomed_ids)} past saving, {note}",
             queue=[order.id for order in rail],
             tags={order_id: "cannot finish in time" for order_id in doomed_ids[:12]},
         )
