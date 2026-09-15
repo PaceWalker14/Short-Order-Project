@@ -1,8 +1,8 @@
-"""Scores every ready order on four things and dispatches the best: next burst
-length (SJF), total work left (SRTF), slack before the customer walks (EDF), and
-whether its next step lands on a station with no place free. Lowest total gets
-the next free cook, and orders that cannot be finished in time go to the back.
-With no ovens to wake us it slices instead, so nobody waits unlooked-at.
+"""Ranks the rail on four things at once: the next burst length, the total work
+left, how long the customer has already been sitting relative to what their food
+needs, and whether the next step lands on a full station. Lowest total gets the
+next free cook; orders that can no longer be finished in time go to the back.
+With no ovens to wake us it slices instead, so nobody sits unlooked-at.
 """
 
 from kitchen import Decision, Scheduler, fill_idle
@@ -17,18 +17,19 @@ def _saturate(value, scale):
 
 class MiseEnPlace(Scheduler):
     name = "mise_en_place"
-    version = "4"
+    version = "5"
 
     W_BURST = 0.45          # shortest job first
-    W_REMAINING = 0.30      # shortest remaining time first
-    W_SLACK = 0.25          # earliest deadline first
+    W_REMAINING = 0.45      # shortest remaining time first
     W_BUMP = 0.20           # penalty for a next step at a full station
+    W_AGE = 0.60            # discount for an order already kept waiting
 
-    # Half-way point of each term, in ticks: roughly the median of the thing
-    # being measured, so a typical order sits in the middle of the curve.
+    # Half-way point of each term, so a typical order sits in the middle of the
+    # curve rather than out on a flat end of it. The first two are ticks; K_AGE
+    # is a slowdown, the same figure the mark is worked out from.
     K_BURST = 8.0
     K_REMAINING = 20.0
-    K_SLACK = 60.0
+    K_AGE = 6.0
 
     # Only read the next station when the step in hand is this close to done;
     # any further out and it will have turned over before we get there.
@@ -97,6 +98,25 @@ class MiseEnPlace(Scheduler):
             return obs.estimate_remaining(order)
         return float(burst)
 
+    def _total_span(self, obs, order):
+        """The whole time this dish needs, work and oven together. The mark
+        divides turnaround by this, floored at the kitchen's own bound."""
+        done = 0.0
+        for step in order.steps[:order.step]:
+            if step.duration is not None:
+                done += step.duration
+        return done + self._remaining_span(obs, order)
+
+    def _pressure(self, obs, order):
+        """The slowdown this order has run up already: how long the customer
+        has been sitting there, over the time their food actually needs.
+
+        Shortest-job-first on its own starves the long orders, and the mark
+        takes the evenness of these figures as its fairness score - so the one
+        with the worst of them is the one to start next, other things equal."""
+        span = max(self._total_span(obs, order), obs.kitchen.slowdown_bound)
+        return (obs.time - order.arrival) / span
+
     def _bump_risk(self, obs, order):
         """1.0 when this order is about to finish its step and move to a station
         with no place free. That sends it back to the rail and costs a second
@@ -133,8 +153,8 @@ class MiseEnPlace(Scheduler):
         cost = (
             self.W_BURST * _saturate(burst, self.K_BURST)
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
-            + self.W_SLACK * _saturate(slack, self.K_SLACK)
             + self.W_BUMP * self._bump_risk(obs, order)
+            - self.W_AGE * _saturate(self._pressure(obs, order), self.K_AGE)
         )
         if doomed:
             cost += self.DOOMED_COST
