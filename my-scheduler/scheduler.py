@@ -48,6 +48,12 @@ class MiseEnPlace(Scheduler):
     ROTATE_QUANTUM = 1
     ROTATE_MIN_BURST = 12
 
+    # Once everybody has been looked at, keep passing the cooks round every
+    # ROTATE_CYCLE ticks instead of running orders out one by one. Sharing the
+    # cooks evenly makes every order take about as long as its own size, which
+    # is what the fairness score is measuring. 0 stops after the first sweep.
+    ROTATE_CYCLE = 44
+
     # Cooks held back for short work, so a banquet can never block every route
     # to a two-tick espresso. 0 reserves nobody.
     FAST_CORES = 0
@@ -214,7 +220,9 @@ class MiseEnPlace(Scheduler):
         # just preempted comes back part-done and short.
         waiting = [order for order in rail if not order.has_started]
         if not waiting:
-            return False
+            # Everybody has had their first tick; carry on only if we are
+            # sharing the cooks out rather than running orders to the end.
+            return self.ROTATE_CYCLE > 0
         floor = self.ROTATE_MIN_BURST + obs.kitchen.switch_cost
         return min(self._burst(obs, order) for order in waiting) > floor
 
@@ -235,6 +243,8 @@ class MiseEnPlace(Scheduler):
                 queue = unstarted
             elif current is None:
                 queue = started             # idle cook, nobody new to look at
+            elif self.ROTATE_CYCLE > 0 and core.running_for >= self.ROTATE_CYCLE:
+                queue = started             # hand the cook on to the next table
             else:
                 continue                    # sweep done; let it run out
             if core.station:
@@ -315,9 +325,9 @@ class MiseEnPlace(Scheduler):
             self._rotate(obs, decision, rail)
         else:
             self._fill(obs, decision, rail)
-        if starved and any(not order.has_started for order in rail):
-            # Nothing else is going to ask us, and somebody has not been looked
-            # at yet - so set the alarm even if it is too early to slice.
+        if starved and rail:
+            # Nothing else is going to ask us, so the alarm is the only way back
+            # in - whether that is to look at somebody new or to pass a cook on.
             decision.wake_in(self.ROTATE_QUANTUM)
 
         note = "slicing" if rotating else "running out"
