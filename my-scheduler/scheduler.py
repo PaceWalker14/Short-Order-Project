@@ -29,8 +29,8 @@ class MiseEnPlace(Scheduler):
     # Half-way point of each term, so a typical order sits in the middle of the
     # curve rather than out on a flat end of it. The first two are ticks; K_AGE
     # is a slowdown, the same figure the mark is worked out from.
-    K_BURST = 8.0
-    K_REMAINING = 20.0
+    K_BURST = 28.0
+    K_REMAINING = 40.0
     K_AGE = 6.0
     K_WAIT = 40.0
 
@@ -52,6 +52,14 @@ class MiseEnPlace(Scheduler):
     # to a two-tick espresso. 0 reserves nobody.
     FAST_CORES = 0
     FAST_LIMIT = 10.0
+
+    # Holding the big dishes back while the rail is long. A cook tied up for
+    # fifty ticks is fifty ticks every ticket behind it waits too, so when the
+    # room is busy the long ones wait for a lull. They cannot starve on it: the
+    # second pass in _fill drops the hold when there is nothing else to cook.
+    # 0 disables.
+    LONG_BURST = 32.0
+    QUEUE_DEPTH = 3.0
 
     def reset(self, seed):
         self._wait_means = {}
@@ -244,30 +252,43 @@ class MiseEnPlace(Scheduler):
                 if core.station:
                     free[core.station] -= 1  # took nothing; keeps its place
 
+    def _choose(self, obs, waiting, free, limit, hold_long):
+        """Index of the first order on the rail this cook may actually take."""
+        for index, order in enumerate(waiting):
+            station = order.station
+            if station is not None and free.get(station, 0) <= 0:
+                continue
+            if limit is not None and self._burst(obs, order) > limit:
+                continue
+            if hold_long and self._burst(obs, order) > self.LONG_BURST:
+                continue
+            return index
+        return None
+
     def _fill(self, obs, decision, rail):
         """Hand the idle cooks their next order, counting station places as they
         are spent so two cooks are never sent to the one place at the pass.
 
-        The last FAST_CORES cooks only pick up short work. Holding a cook back
-        costs something when there is nothing short to give it, so it takes
-        whatever it can whenever the whole kitchen is standing still."""
+        The last FAST_CORES cooks only pick up short work. The long dishes are
+        held back while the room is busy, but the hold is dropped on the second
+        pass so no cook ever stands still purely because everything is big."""
         free = obs.free_stations()
         waiting = list(rail)
         reserved = set()
         if 0 < self.FAST_CORES < len(obs.cores) and len(obs.idle_cores) < len(obs.cores):
             reserved = {core.id for core in obs.cores[-self.FAST_CORES:]}
+        busy = (self.LONG_BURST > 0.0
+                and len(rail) > self.QUEUE_DEPTH * max(1, len(obs.cores)))
         for core in obs.idle_cores:
             limit = self.FAST_LIMIT if core.id in reserved else None
-            for index, order in enumerate(waiting):
-                if limit is not None and self._burst(obs, order) > limit:
+            for hold_long in (True, False):
+                index = self._choose(obs, waiting, free, limit, busy and hold_long)
+                if index is None:
                     continue
-                station = order.station
-                if station is not None and free.get(station, 0) <= 0:
-                    continue
+                order = waiting.pop(index)
                 decision.assign(core, order)
-                if station is not None:
-                    free[station] -= 1
-                waiting.pop(index)
+                if order.station is not None:
+                    free[order.station] -= 1
                 break
 
     # -- the decision -------------------------------------------------------
