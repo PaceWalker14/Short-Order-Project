@@ -1,11 +1,11 @@
-"""Ranks the rail on four things at once: the next burst length, the total work
-left, how long the customer has already been sitting relative to what their food
-needs, and whether the next step lands on a full station. Lowest total gets the
-next free cook; orders that can no longer be finished in time go to the back.
-With no ovens to wake us it slices instead, so nobody sits unlooked-at.
+"""Ranks the rail on how long the next burst is, how much work is left, how long
+the customer has been sitting relative to what their food needs, whether the
+next step lands on a full station, and whether the dish is short enough to be
+worth clearing outright. Lowest total gets the next free cook; orders that can
+no longer be finished in time go to the back. Nothing is ever interrupted.
 """
 
-from kitchen import Decision, Scheduler, fill_idle
+from kitchen import Decision, Scheduler
 
 
 def _saturate(value, scale):
@@ -23,6 +23,8 @@ class MiseEnPlace(Scheduler):
     W_REMAINING = 0.45      # shortest remaining time first
     W_BUMP = 0.20           # penalty for a next step at a full station
     W_AGE = 0.60            # discount for an order already kept waiting
+    W_WAIT = 0.00           # discount for raw ticks spent on the rail
+    W_FAST = 0.08           # discount for a dish shorter than the slowdown floor
 
     # Half-way point of each term, so a typical order sits in the middle of the
     # curve rather than out on a flat end of it. The first two are ticks; K_AGE
@@ -30,6 +32,7 @@ class MiseEnPlace(Scheduler):
     K_BURST = 8.0
     K_REMAINING = 20.0
     K_AGE = 6.0
+    K_WAIT = 40.0
 
     # Only read the next station when the step in hand is this close to done;
     # any further out and it will have turned over before we get there.
@@ -44,6 +47,11 @@ class MiseEnPlace(Scheduler):
     # nothing is gained by making it longer. 0 turns slicing off.
     ROTATE_QUANTUM = 1
     ROTATE_MIN_BURST = 12
+
+    # Cooks held back for short work, so a banquet can never block every route
+    # to a two-tick espresso. 0 reserves nobody.
+    FAST_CORES = 0
+    FAST_LIMIT = 10.0
 
     def reset(self, seed):
         self._wait_means = {}
@@ -98,24 +106,13 @@ class MiseEnPlace(Scheduler):
             return obs.estimate_remaining(order)
         return float(burst)
 
-    def _total_span(self, obs, order):
-        """The whole time this dish needs, work and oven together. The mark
-        divides turnaround by this, floored at the kitchen's own bound."""
+    def _done_span(self, order):
+        """Time this dish has already used up, work and oven together."""
         done = 0.0
         for step in order.steps[:order.step]:
             if step.duration is not None:
                 done += step.duration
-        return done + self._remaining_span(obs, order)
-
-    def _pressure(self, obs, order):
-        """The slowdown this order has run up already: how long the customer
-        has been sitting there, over the time their food actually needs.
-
-        Shortest-job-first on its own starves the long orders, and the mark
-        takes the evenness of these figures as its fairness score - so the one
-        with the worst of them is the one to start next, other things equal."""
-        span = max(self._total_span(obs, order), obs.kitchen.slowdown_bound)
-        return (obs.time - order.arrival) / span
+        return done
 
     def _bump_risk(self, obs, order):
         """1.0 when this order is about to finish its step and move to a station
@@ -140,22 +137,36 @@ class MiseEnPlace(Scheduler):
     # -- the composite cost -------------------------------------------------
 
     def _cost(self, obs, order, switch_cost):
-        """Four costs in [0, 1), added by weight. Lowest wins."""
+        """Everything the rail is sorted on, added up. Lowest wins."""
         burst = self._burst(obs, order)
         remaining = obs.estimate_remaining(order)
         span = self._remaining_span(obs, order)
+        whole = self._done_span(order) + span
+        bound = obs.kitchen.slowdown_bound
 
         # Spare time once the dish's own time is paid for. Negative means the
         # customer is gone before it is plated whoever starts it.
         slack = order.time_left - span - switch_cost
         doomed = slack < 0.0
 
+        # The slowdown this order has run up already: how long the customer has
+        # been sitting there, over the time their food actually needs. Shortest
+        # job first starves the long orders on its own, and the evenness of
+        # these figures is the fairness score.
+        pressure = (obs.time - order.arrival) / max(whole, bound)
+
         cost = (
             self.W_BURST * _saturate(burst, self.K_BURST)
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
             + self.W_BUMP * self._bump_risk(obs, order)
-            - self.W_AGE * _saturate(self._pressure(obs, order), self.K_AGE)
+            - self.W_AGE * _saturate(pressure, self.K_AGE)
+            - self.W_WAIT * _saturate(order.waited, self.K_WAIT)
         )
+        if whole < bound:
+            # Slowdown divides by the floor, never by anything smaller, so a
+            # dish below it gets no credit for being small - it only ever loses
+            # by waiting. Those are the ones to clear first.
+            cost -= self.W_FAST
         if doomed:
             cost += self.DOOMED_COST
         return cost, doomed
@@ -233,6 +244,32 @@ class MiseEnPlace(Scheduler):
                 if core.station:
                     free[core.station] -= 1  # took nothing; keeps its place
 
+    def _fill(self, obs, decision, rail):
+        """Hand the idle cooks their next order, counting station places as they
+        are spent so two cooks are never sent to the one place at the pass.
+
+        The last FAST_CORES cooks only pick up short work. Holding a cook back
+        costs something when there is nothing short to give it, so it takes
+        whatever it can whenever the whole kitchen is standing still."""
+        free = obs.free_stations()
+        waiting = list(rail)
+        reserved = set()
+        if 0 < self.FAST_CORES < len(obs.cores) and len(obs.idle_cores) < len(obs.cores):
+            reserved = {core.id for core in obs.cores[-self.FAST_CORES:]}
+        for core in obs.idle_cores:
+            limit = self.FAST_LIMIT if core.id in reserved else None
+            for index, order in enumerate(waiting):
+                if limit is not None and self._burst(obs, order) > limit:
+                    continue
+                station = order.station
+                if station is not None and free.get(station, 0) <= 0:
+                    continue
+                decision.assign(core, order)
+                if station is not None:
+                    free[station] -= 1
+                waiting.pop(index)
+                break
+
     # -- the decision -------------------------------------------------------
 
     def schedule(self, obs):
@@ -256,9 +293,7 @@ class MiseEnPlace(Scheduler):
         if rotating:
             self._rotate(obs, decision, rail)
         else:
-            # Walks the rail in order, skipping anything whose station is full
-            # and counting places as it spends them.
-            fill_idle(decision, obs, rail)
+            self._fill(obs, decision, rail)
         if starved and any(not order.has_started for order in rail):
             # Nothing else is going to ask us, and somebody has not been looked
             # at yet - so set the alarm even if it is too early to slice.
