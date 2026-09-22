@@ -47,10 +47,12 @@ Serve only the quick dishes and completion looks wonderful while the banquet
 table quietly starves. Rotate everybody fairly and you spend the whole service
 switching and cook nothing. The interesting part is the tension.
 
-It is also marked across **nine different kitchens** — a single cook, four
+It is also marked across **ten different kitchens** — a single cook, four
 cooks, a Friday rush with more custom than anyone can serve, a night of nothing
 but slow roasts, a service where the recipes are hidden, a private booking.
-A strategy that only works in one of them isn't a strategy.
+A strategy that only works in one of them isn't a strategy, so nothing here is
+allowed to be tuned for a particular menu — the scheduler works out what kind
+of kitchen it is standing in from what it can see, and adapts.
 
 ---
 
@@ -80,6 +82,12 @@ the dish could possibly be plated, cooking it is a loss taken on purpose: they
 leave anyway, and the time is stolen from someone who would have stayed. Those
 orders go to the very back.
 
+**Hold the big dishes back when the room is full.** A cook tied up on a
+fifty-minute banquet is fifty minutes that every ticket behind it waits as
+well. So while the rail is long, the biggest dishes sit out and wait for a
+lull. They can't be stranded there — the moment a cook has nothing else to
+pick up, the hold comes off and the banquet goes on.
+
 **Never interrupt.** Taking a cook off a half-finished dish costs twice — once
 to switch away, once to come back. Tempting in theory, measurably worse in
 practice. Every version that preempted scored below the one that didn't.
@@ -88,25 +96,32 @@ practice. Every version that preempted scored below the one that didn't.
 sent to a full station just bounces back, so the scheduler checks there is
 somewhere to stand before it commits a cook.
 
-**In a silent kitchen, set an alarm.** One of the nine services is a private
-booking: the whole party arrives at once, nothing goes in an oven, and nothing
-else ever happens. Start a long dish there and the kitchen has no reason to ask
-you anything for the next several hundred ticks — so the last table waits the
-entire evening before anyone even looks at them. The fix is a timer: wake up
-anyway, touch every table briefly so nobody is ignored, then settle down and
-cook. That one change was worth ten points on that service alone.
+**In a silent kitchen, set an alarm — then share the cooks round.** One of the
+services is a private booking: the party arrives in sittings, nothing goes in
+an oven, and between sittings nothing happens at all. Start a long dish there
+and the kitchen has no reason to ask you anything for hundreds of ticks, so the
+last table waits the whole evening before anyone even looks at them.
+
+The fix is a timer, and it does two jobs. First it wakes the kitchen up to give
+every table a moment of attention, so nobody sits ignored. Then it keeps going:
+rather than finishing one dish at a time, the cooks hand over to the next table
+every so often. Nobody is served especially early, but everybody waits roughly
+in proportion to what they ordered — a small plate doesn't spend the evening
+stuck behind a centrepiece. That evenness is worth more on this service than
+the time lost handing over, and it turned a weak result into the strongest one
+on the board.
 
 ---
 
 ## How it does
 
-Scored across all nine kitchens, it comes out a little ahead of the strongest
-scheduler built into the simulation — the one the exercise sets as the target
-to beat.
+Scored across every kitchen, it comes out ahead of the strongest scheduler
+built into the simulation — the one the exercise sets as the target to beat.
 
-It is strongest where there is slack to exploit and weakest on the Friday rush,
-which is deliberately designed so that more customers arrive than two cooks can
-ever serve. Some of those tables were always going home hungry.
+It is strongest on the private booking, where the timer earns its keep, and on
+the four-cook service line. It is weakest on the Friday rush, which is designed
+so that more customers arrive than two cooks can ever serve — some of those
+tables were always going home hungry, and the job there is choosing which.
 
 ---
 

@@ -67,8 +67,15 @@ class MiseEnPlace(Scheduler):
     LONG_BURST = 32.0
     QUEUE_DEPTH = 3.0
 
+    # Taking a cook off a long dish for a much shorter one. The swap is paid
+    # for twice - a switch now, and another to pick the long dish back up - so
+    # the shorter order has to save at least this many switches' worth of work
+    # before it is worth doing. 0 never preempts.
+    PREEMPT_GAIN = 0.0
+
     def reset(self, seed):
         self._wait_means = {}
+        self._bursts = {}
 
     # -- estimation ---------------------------------------------------------
 
@@ -115,10 +122,13 @@ class MiseEnPlace(Scheduler):
 
     def _burst(self, obs, order):
         """Cook time before this order next lets go of its cook."""
+        known = self._bursts.get(order.id)
+        if known is not None:
+            return known
         burst = order.work_until_wait
-        if burst is None:
-            return obs.estimate_remaining(order)
-        return float(burst)
+        burst = float(obs.estimate_remaining(order)) if burst is None else float(burst)
+        self._bursts[order.id] = burst
+        return burst
 
     def _done_span(self, order):
         """Time this dish has already used up, work and oven together."""
@@ -213,7 +223,11 @@ class MiseEnPlace(Scheduler):
         Only once the door has been shut a while, and only when a slice is short
         next to the jobs on the rail - with a one-tick espresso waiting, slicing
         changes nobody's turn and just spends switches."""
-        if self.ROTATE_QUANTUM <= 0 or len(rail) <= len(obs.cores):
+        # Measured against the cooks actually free, not against all of them: a
+        # party arriving in sittings leaves one table waiting while both cooks
+        # are buried in long dishes, and that is exactly when a slice is worth
+        # most.
+        if self.ROTATE_QUANTUM <= 0 or len(rail) <= len(obs.idle_cores):
             return False
         # Only the orders nobody has looked at yet. Judging this on the whole
         # rail switches rotation off the moment it starts, because the order it
@@ -301,10 +315,58 @@ class MiseEnPlace(Scheduler):
                     free[order.station] -= 1
                 break
 
+    def _preempt(self, obs, decision, rail, switch_cost, doomed):
+        """Take a cook off a long dish for a much shorter one.
+
+        Shortest remaining time first: the swap pays when the waiting order is
+        enough shorter to cover both switches - the one now and the one to pick
+        the long dish back up again. Judged in ticks of work rather than on the
+        ranking score, so an order that is merely impatient never sets it off
+        and the cooks cannot be made to thrash between two long dishes."""
+        if self.PREEMPT_GAIN <= 0.0:
+            return
+        margin = self.PREEMPT_GAIN * max(1, switch_cost)
+        free = obs.free_stations()
+        taken = set()
+        for order_id in decision.assignments.values():
+            if order_id is None:
+                continue
+            taken.add(order_id)
+            order = obs.order(order_id)
+            if order is not None and order.station:
+                free[order.station] = free.get(order.station, 0) - 1
+        queue = [o for o in rail if o.id not in taken and o.id not in doomed]
+        for core in obs.working_cores:
+            if not queue or core.id in decision.assignments:
+                continue
+            current = obs.order_on(core)
+            if current is None or core.running_for <= 0:
+                continue                    # still paying its switch; leave it
+            here = self._burst(obs, current)
+            if core.station:
+                free[core.station] = free.get(core.station, 0) + 1
+            chosen = None
+            for index, candidate in enumerate(queue):
+                if self._burst(obs, candidate) + margin >= here:
+                    continue
+                station = candidate.station
+                if station is None or free.get(station, 0) > 0:
+                    chosen = index
+                    break
+            if chosen is None:
+                if core.station:
+                    free[core.station] = free.get(core.station, 0) - 1
+                continue
+            candidate = queue.pop(chosen)
+            decision.assign(core, candidate)
+            if candidate.station is not None:
+                free[candidate.station] -= 1
+
     # -- the decision -------------------------------------------------------
 
     def schedule(self, obs):
         self._wait_means = {}
+        self._bursts = {}
         switch_cost = obs.kitchen.switch_cost
 
         scored = []
@@ -325,6 +387,7 @@ class MiseEnPlace(Scheduler):
             self._rotate(obs, decision, rail)
         else:
             self._fill(obs, decision, rail)
+            self._preempt(obs, decision, rail, switch_cost, set(doomed_ids))
         if starved and rail:
             # Nothing else is going to ask us, so the alarm is the only way back
             # in - whether that is to look at somebody new or to pass a cook on.
