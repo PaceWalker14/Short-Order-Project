@@ -23,6 +23,9 @@ class MiseEnPlace(Scheduler):
     W_REMAINING = 0.45      # shortest remaining time first
     W_BUMP = 0.20           # penalty for a next step at a full station
     W_AGE = 0.60            # discount for an order already kept waiting
+    # In the dark the span this is divided by is a guess, so the whole term is
+    # noisier and worth leaning on less.
+    W_AGE_BLIND = 0.15
     W_FAST = 0.08           # discount for a dish shorter than the slowdown floor
 
     # Half-way point of each term, so a typical order sits in the middle of the
@@ -50,7 +53,13 @@ class MiseEnPlace(Scheduler):
     # ROTATE_CYCLE ticks instead of running orders out one by one. Sharing the
     # cooks evenly makes every order take about as long as its own size, which
     # is what the fairness score is measuring. 0 stops after the first sweep.
-    ROTATE_CYCLE = 44
+    ROTATE_CYCLE = 10
+
+    # A cook only hands its dish on when somebody on the rail is this much
+    # worse off than the table it is cooking for. Fairness is the evenness of
+    # those figures, so swapping when they are already level costs a switch and
+    # buys nothing. 0 hands over on the clock alone.
+    ROTATE_SPREAD = 0.05
 
     # Holding the big dishes back while the rail is long. A cook tied up for
     # fifty ticks is fifty ticks every ticket behind it waits too, so when the
@@ -117,6 +126,12 @@ class MiseEnPlace(Scheduler):
         self._bursts[order.id] = burst
         return burst
 
+    def _pressure(self, obs, order):
+        """The slowdown this order has run up already: how long the customer has
+        been sitting there, over the time their food actually needs."""
+        whole = self._done_span(order) + self._remaining_span(obs, order)
+        return (obs.time - order.arrival) / max(whole, obs.kitchen.slowdown_bound)
+
     def _done_span(self, order):
         """Time this dish has already used up, work and oven together."""
         done = 0.0
@@ -165,12 +180,13 @@ class MiseEnPlace(Scheduler):
         # job first starves the long orders on its own, and the evenness of
         # these figures is the fairness score.
         pressure = (obs.time - order.arrival) / max(whole, bound)
+        aging = self.W_AGE if obs.kitchen.known_durations else self.W_AGE_BLIND
 
         cost = (
             self.W_BURST * _saturate(burst, self.K_BURST)
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
             + self.W_BUMP * self._bump_risk(obs, order)
-            - self.W_AGE * _saturate(pressure, self.K_AGE)
+            - aging * _saturate(pressure, self.K_AGE)
         )
         if whole < bound:
             # Slowdown divides by the floor, never by anything smaller, so a
@@ -226,6 +242,14 @@ class MiseEnPlace(Scheduler):
         floor = self.ROTATE_MIN_BURST + obs.kitchen.switch_cost
         return min(self._burst(obs, order) for order in waiting) > floor
 
+    def _worse_off(self, obs, waiting, current):
+        """Whether anybody waiting has run up a worse slowdown than the table
+        this cook is already serving, by enough to be worth the switch."""
+        if self.ROTATE_SPREAD <= 0.0:
+            return True
+        here = self._pressure(obs, current)
+        return any(self._pressure(obs, o) - here > self.ROTATE_SPREAD for o in waiting)
+
     def _rotate(self, obs, decision, rail):
         """Give each cook that has had its slice the next never-started order.
 
@@ -243,7 +267,8 @@ class MiseEnPlace(Scheduler):
                 queue = unstarted
             elif current is None:
                 queue = started             # idle cook, nobody new to look at
-            elif self.ROTATE_CYCLE > 0 and core.running_for >= self.ROTATE_CYCLE:
+            elif (self.ROTATE_CYCLE > 0 and core.running_for >= self.ROTATE_CYCLE
+                    and started and self._worse_off(obs, started, current)):
                 queue = started             # hand the cook on to the next table
             else:
                 continue                    # sweep done; let it run out
