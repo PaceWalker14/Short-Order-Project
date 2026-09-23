@@ -21,7 +21,6 @@ class MiseEnPlace(Scheduler):
 
     W_BURST = 0.45          # shortest job first
     W_REMAINING = 0.45      # shortest remaining time first
-    W_BUMP = 0.20           # penalty for a next step at a full station
     W_AGE = 0.60            # discount for an order already kept waiting
     # In the dark the span this is divided by is a guess, so the whole term is
     # noisier and worth leaning on less.
@@ -34,10 +33,6 @@ class MiseEnPlace(Scheduler):
     K_BURST = 28.0
     K_REMAINING = 40.0
     K_AGE = 6.0
-
-    # Only read the next station when the step in hand is this close to done;
-    # any further out and it will have turned over before we get there.
-    BUMP_HORIZON = 4.0
 
     # Big enough to put the hopeless orders behind every servable one without
     # losing their order among themselves.
@@ -145,26 +140,6 @@ class MiseEnPlace(Scheduler):
                 done += step.duration
         return done
 
-    def _bump_risk(self, obs, order):
-        """1.0 when this order is about to finish its step and move to a station
-        with no place free. That sends it back to the rail and costs a second
-        switch to pick it up again."""
-        nxt = order.step + 1
-        if nxt >= len(order.steps):
-            return 0.0
-        name = order.steps[nxt].station
-        if name is None:
-            return 0.0                      # the oven needs no place
-        step = order.current_step
-        if step is None or step.remaining is None:
-            return 0.0
-        if step.remaining > self.BUMP_HORIZON:
-            return 0.0
-        station = obs.station(name)
-        if station is None:
-            return 0.0
-        return 0.0 if station.free > 0 else 1.0
-
     # -- the composite cost -------------------------------------------------
 
     def _cost(self, obs, order, switch_cost):
@@ -190,7 +165,6 @@ class MiseEnPlace(Scheduler):
         cost = (
             self.W_BURST * _saturate(burst, self.K_BURST)
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
-            + self.W_BUMP * self._bump_risk(obs, order)
             - aging * _saturate(pressure, self.K_AGE)
         )
         if whole < bound:
