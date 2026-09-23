@@ -69,6 +69,11 @@ class MiseEnPlace(Scheduler):
     LONG_BURST = 32.0
     QUEUE_DEPTH = 3.0
 
+    # Interrupting a cook so an order nobody has touched gets its first tick of
+    # work. Worth it only behind a long dish, measured against what a switch
+    # costs here - that is the price paid for it. 0 never does it.
+    TOUCH_RATIO = 25.0
+
     def reset(self, seed):
         self._wait_means = {}
         self._bursts = {}
@@ -320,6 +325,50 @@ class MiseEnPlace(Scheduler):
                     free[order.station] -= 1
                 break
 
+    def _touch(self, obs, decision, rail, switch_cost):
+        """Interrupt a cook that will not be free for a long time, so an order
+        nobody has looked at yet gets its first tick of work.
+
+        Response is counted at that tick and never revisited, so one tick banks
+        it for good - and a first dispatch counts as starting fresh work rather
+        than resuming, so the switching mark does not suffer for it either. Only
+        worth doing behind a long dish: where cooks turn over quickly the order
+        would have been reached soon anyway, and the switch is wasted."""
+        if self.TOUCH_RATIO <= 0.0:
+            return
+        floor = self.TOUCH_RATIO * max(1, switch_cost)
+        placed = {o for o in decision.assignments.values() if o is not None}
+        fresh = [o for o in rail if not o.has_started and o.id not in placed]
+        if not fresh:
+            return
+        free = obs.free_stations()
+        for order_id in placed:
+            order = obs.order(order_id)
+            if order is not None and order.station:
+                free[order.station] = free.get(order.station, 0) - 1
+        for core in obs.working_cores:
+            if not fresh or core.id in decision.assignments:
+                continue
+            current = obs.order_on(core)
+            if current is None or not current.has_started:
+                continue
+            if self._burst(obs, current) < floor:
+                continue                    # this cook is free again soon
+            if core.station:
+                free[core.station] = free.get(core.station, 0) + 1
+            for index, candidate in enumerate(fresh):
+                station = candidate.station
+                if station is not None and free.get(station, 0) <= 0:
+                    continue
+                decision.assign(core, candidate)
+                if station is not None:
+                    free[station] -= 1
+                fresh.pop(index)
+                break
+            else:
+                if core.station:
+                    free[core.station] = free.get(core.station, 0) - 1
+
     # -- the decision -------------------------------------------------------
 
     def schedule(self, obs):
@@ -345,6 +394,7 @@ class MiseEnPlace(Scheduler):
             self._rotate(obs, decision, rail)
         else:
             self._fill(obs, decision, rail)
+            self._touch(obs, decision, rail, switch_cost)
         if starved and rail:
             # Nothing else is going to ask us, so the alarm is the only way back
             # in - whether that is to look at somebody new or to pass a cook on.
