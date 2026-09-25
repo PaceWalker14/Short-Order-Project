@@ -1,8 +1,13 @@
 """Ranks the rail on how long the next burst is, how much work is left, how long
-the customer has been sitting relative to what their food needs, whether the
-next step lands on a full station, and whether the dish is short enough to be
-worth clearing outright. Lowest total gets the next free cook; orders that can
-no longer be finished in time go to the back. Nothing is ever interrupted.
+the customer has been sitting relative to what their food needs, whether anyone
+has started it yet, and whether the dish is short enough to be worth clearing
+outright. Lowest total gets the next free cook; orders that can no longer be
+finished in time go to the back.
+
+A cook is taken off a dish in three cases only: to start an order nobody has
+looked at while the cook is buried in a very long dish, after giving a long dish
+its first tick on the way to something else, and to pass the cooks round in a
+kitchen that will not call back on its own.
 """
 
 from kitchen import Decision, Scheduler
@@ -17,7 +22,7 @@ def _saturate(value, scale):
 
 class MiseEnPlace(Scheduler):
     name = "mise_en_place"
-    version = "5"
+    version = "6"
 
     W_BURST = 0.45          # shortest job first
     W_REMAINING = 0.45      # shortest remaining time first
@@ -26,6 +31,10 @@ class MiseEnPlace(Scheduler):
     # noisier and worth leaning on less.
     W_AGE_BLIND = 0.15
     W_FAST = 0.08           # discount for a dish shorter than the slowdown floor
+    # Response stops at an order's first tick of work, so an order nobody has
+    # started is running up that mark every tick it waits and a started one is
+    # not.
+    W_FRESH = 0.07
 
     # Half-way point of each term, so a typical order sits in the middle of the
     # curve rather than out on a flat end of it. The first two are ticks; K_AGE
@@ -58,9 +67,8 @@ class MiseEnPlace(Scheduler):
 
     # Holding the big dishes back while the rail is long. A cook tied up for
     # fifty ticks is fifty ticks every ticket behind it waits too, so when the
-    # room is busy the long ones wait for a lull. They cannot starve on it: the
-    # second pass in _fill drops the hold when there is nothing else to cook.
-    # 0 disables.
+    # room is busy the long ones wait for a lull. They cannot starve on it:
+    # _choose drops the hold when there is nothing else to cook. 0 disables.
     LONG_BURST = 32.0
     QUEUE_DEPTH = 3.0
 
@@ -69,9 +77,20 @@ class MiseEnPlace(Scheduler):
     # costs here - that is the price paid for it. 0 never does it.
     TOUCH_RATIO = 25.0
 
+    # Giving a long dish its first tick on the way past. A banquet left behind
+    # the quick jobs costs the response mark every tick it sits there, and one
+    # tick of work banks the lot. So a free cook first stops at the
+    # longest-waiting dish nobody has started whose burst is longer than this,
+    # spends the switch and one tick on it, then carries on to the order it was
+    # going to take. Shorter dishes come up soon enough on their own, and the
+    # switch it would cost to resume them is wasted. 0 disables.
+    EARLY_TICK_BURST = 15.0
+
     def reset(self, seed):
         self._wait_means = {}
         self._bursts = {}
+        # Cook id -> the order it has been sent to give an early tick.
+        self._early_ticks = {}
 
     # -- estimation ---------------------------------------------------------
 
@@ -126,10 +145,13 @@ class MiseEnPlace(Scheduler):
         self._bursts[order.id] = burst
         return burst
 
-    def _pressure(self, obs, order):
+    def _pressure(self, obs, order, whole=None):
         """The slowdown this order has run up already: how long the customer has
-        been sitting there, over the time their food actually needs."""
-        whole = self._done_span(order) + self._remaining_span(obs, order)
+        been sitting there, over the time their food actually needs. Shortest
+        job first starves the long orders on its own, and the evenness of these
+        figures is the fairness score."""
+        if whole is None:
+            whole = self._done_span(order) + self._remaining_span(obs, order)
         return (obs.time - order.arrival) / max(whole, obs.kitchen.slowdown_bound)
 
     def _done_span(self, order):
@@ -142,24 +164,19 @@ class MiseEnPlace(Scheduler):
 
     # -- the composite cost -------------------------------------------------
 
-    def _cost(self, obs, order, switch_cost):
+    def _cost(self, obs, order):
         """Everything the rail is sorted on, added up. Lowest wins."""
         burst = self._burst(obs, order)
         remaining = obs.estimate_remaining(order)
         span = self._remaining_span(obs, order)
         whole = self._done_span(order) + span
-        bound = obs.kitchen.slowdown_bound
 
         # Spare time once the dish's own time is paid for. Negative means the
         # customer is gone before it is plated whoever starts it.
-        slack = order.time_left - span - switch_cost
+        slack = order.time_left - span - obs.kitchen.switch_cost
         doomed = slack < 0.0
 
-        # The slowdown this order has run up already: how long the customer has
-        # been sitting there, over the time their food actually needs. Shortest
-        # job first starves the long orders on its own, and the evenness of
-        # these figures is the fairness score.
-        pressure = (obs.time - order.arrival) / max(whole, bound)
+        pressure = self._pressure(obs, order, whole)
         aging = self.W_AGE if obs.kitchen.known_durations else self.W_AGE_BLIND
 
         cost = (
@@ -167,14 +184,54 @@ class MiseEnPlace(Scheduler):
             + self.W_REMAINING * _saturate(remaining, self.K_REMAINING)
             - aging * _saturate(pressure, self.K_AGE)
         )
-        if whole < bound:
+        if whole < obs.kitchen.slowdown_bound:
             # Slowdown divides by the floor, never by anything smaller, so a
             # dish below it gets no credit for being small - it only ever loses
             # by waiting. Those are the ones to clear first.
             cost -= self.W_FAST
+        if not order.has_started:
+            cost -= self.W_FRESH
         if doomed:
             cost += self.DOOMED_COST
         return cost, doomed
+
+    # -- station places -----------------------------------------------------
+    #
+    # `free` is the number of places left at each station, spent as the
+    # decision is built so two cooks are never sent to the one place at the
+    # pass. A cook that is already holding a place lends it back while it is
+    # deciding where to go, and reclaims it if it stays put.
+
+    @staticmethod
+    def _has_place(order, free):
+        return order.station is None or free.get(order.station, 0) > 0
+
+    @staticmethod
+    def _place(decision, core, order, free):
+        decision.assign(core, order)
+        if order.station is not None:
+            free[order.station] = free.get(order.station, 0) - 1
+
+    @staticmethod
+    def _lend(core, free):
+        if core.station:
+            free[core.station] = free.get(core.station, 0) + 1
+
+    @staticmethod
+    def _reclaim(core, free):
+        if core.station:
+            free[core.station] = free.get(core.station, 0) - 1
+
+    def _hand_over(self, decision, core, queue, free):
+        """Move a cook onto the first order in `queue` it can start, taking that
+        order off the queue. A cook with nowhere to go keeps what it has."""
+        self._lend(core, free)
+        for index, order in enumerate(queue):
+            if self._has_place(order, free):
+                self._place(decision, core, order, free)
+                queue.pop(index)
+                return
+        self._reclaim(core, free)
 
     # -- rotation -----------------------------------------------------------
 
@@ -213,13 +270,13 @@ class MiseEnPlace(Scheduler):
         # Only the orders nobody has looked at yet. Judging this on the whole
         # rail switches rotation off the moment it starts, because the order it
         # just preempted comes back part-done and short.
-        waiting = [order for order in rail if not order.has_started]
-        if not waiting:
+        unstarted = [order for order in rail if not order.has_started]
+        if not unstarted:
             # Everybody has had their first tick; carry on only if we are
             # sharing the cooks out rather than running orders to the end.
             return self.ROTATE_CYCLE > 0
         floor = self.ROTATE_MIN_BURST + obs.kitchen.switch_cost
-        return min(self._burst(obs, order) for order in waiting) > floor
+        return min(self._burst(obs, order) for order in unstarted) > floor
 
     def _worse_off(self, obs, waiting, current):
         """Whether anybody waiting has run up a worse slowdown than the table
@@ -233,8 +290,9 @@ class MiseEnPlace(Scheduler):
         """Give each cook that has had its slice the next never-started order.
 
         Response is measured at the first tick of work, so one sweep across the
-        rail banks it - after that everybody has been looked at and the cooks
-        run their orders out."""
+        rail banks it. After that the cooks are passed on every ROTATE_CYCLE
+        ticks to whoever has come off worst, so that every order takes about as
+        long as its own size."""
         unstarted = [o for o in rail if not o.has_started]
         started = [o for o in rail if o.has_started]
         free = obs.free_stations()
@@ -250,110 +308,133 @@ class MiseEnPlace(Scheduler):
                     and started and self._worse_off(obs, started, current)):
                 queue = started             # hand the cook on to the next table
             else:
-                continue                    # sweep done; let it run out
-            if core.station:
-                free[core.station] = free.get(core.station, 0) + 1
-            for index, order in enumerate(queue):
-                station = order.station
-                if station is not None and free.get(station, 0) <= 0:
-                    continue
-                decision.assign(core, order)
-                if station is not None:
-                    free[station] -= 1
-                queue.pop(index)
-                break
-            else:
-                if core.station:
-                    free[core.station] -= 1  # took nothing; keeps its place
+                continue                    # nobody worse off; let it run
+            self._hand_over(decision, core, queue, free)
 
-    def _choose(self, obs, waiting, free, hold_long):
-        """Index of the first order on the rail this cook may actually take."""
+    # -- running orders out -------------------------------------------------
+
+    def _choose(self, obs, waiting, free, busy):
+        """Index of the first order on the rail this cook may actually take.
+
+        While the room is busy the long dishes are passed over, but the first
+        of them is kept as a fallback so no cook ever stands still purely
+        because everything on the rail is big."""
+        fallback = None
         for index, order in enumerate(waiting):
-            station = order.station
-            if station is not None and free.get(station, 0) <= 0:
+            if not self._has_place(order, free):
                 continue
-            if hold_long and self._burst(obs, order) > self.LONG_BURST:
+            if busy and self._burst(obs, order) > self.LONG_BURST:
+                if fallback is None:
+                    fallback = index
                 continue
             return index
+        return fallback
+
+    def _settle_early_ticks(self, obs):
+        """Split the early ticks in flight into the cooks that have banked
+        theirs and may move on, and the ones still paying the switch."""
+        banked = []
+        pending = {}
+        for core in obs.cores:
+            order_id = self._early_ticks.get(core.id)
+            if order_id is None or core.order != order_id:
+                continue                    # finished, or taken off it
+            if core.running_for >= 1:
+                banked.append(core)
+            else:
+                pending[core.id] = order_id
+        return banked, pending
+
+    def _long_untouched(self, obs, rail):
+        """The dishes worth an early tick, longest-waiting first."""
+        if self.EARLY_TICK_BURST <= 0.0:
+            return []
+        orders = [o for o in rail
+                  if not o.has_started and self._burst(obs, o) > self.EARLY_TICK_BURST]
+        orders.sort(key=lambda o: o.arrival)
+        return orders
+
+    def _early_tick_for(self, untouched, target, free):
+        """The long dish to stop at on the way to `target`, if any."""
+        for order in untouched:
+            if order is not target and self._has_place(order, free):
+                return order
         return None
 
     def _fill(self, obs, decision, rail):
-        """Hand the idle cooks their next order, counting station places as they
-        are spent so two cooks are never sent to the one place at the pass.
-
-        The long dishes are held back while the room is busy, but the hold is
-        dropped on the second pass so no cook ever stands still purely because
-        everything on the rail is big."""
+        """Hand every free cook its next order: the idle ones, and the ones that
+        have just banked an early tick. Returns whether any cook was sent for an
+        early tick, so the caller can set the alarm that brings it back."""
         free = obs.free_stations()
         waiting = list(rail)
         busy = (self.LONG_BURST > 0.0
                 and len(rail) > self.QUEUE_DEPTH * max(1, len(obs.cores)))
-        for core in obs.idle_cores:
-            for hold_long in (True, False):
-                index = self._choose(obs, waiting, free, busy and hold_long)
-                if index is None:
-                    continue
-                order = waiting.pop(index)
-                decision.assign(core, order)
-                if order.station is not None:
-                    free[order.station] -= 1
-                break
+        banked, self._early_ticks = self._settle_early_ticks(obs)
+        untouched = self._long_untouched(obs, rail)
+        sent_early = False
+        for core in obs.idle_cores + banked:
+            moving_on = core in banked
+            if moving_on:
+                self._lend(core, free)
+            index = self._choose(obs, waiting, free, busy)
+            if index is None:
+                if moving_on:
+                    self._reclaim(core, free)   # nothing better; carry on
+                continue
+            early = self._early_tick_for(untouched, waiting[index], free)
+            if early is not None:
+                untouched.remove(early)
+                waiting.remove(early)
+                self._early_ticks[core.id] = early.id
+                self._place(decision, core, early, free)
+                sent_early = True
+                continue
+            order = waiting.pop(index)
+            if order in untouched:
+                untouched.remove(order)
+            self._place(decision, core, order, free)
+        return sent_early
 
-    def _touch(self, obs, decision, rail, switch_cost):
+    def _touch(self, obs, decision, rail):
         """Interrupt a cook that will not be free for a long time, so an order
         nobody has looked at yet gets its first tick of work.
 
         Response is counted at that tick and never revisited, so one tick banks
-        it for good - and a first dispatch counts as starting fresh work rather
-        than resuming, so the switching mark does not suffer for it either. Only
-        worth doing behind a long dish: where cooks turn over quickly the order
-        would have been reached soon anyway, and the switch is wasted."""
+        it for good. The price is the switch paid later to resume the dish that
+        was interrupted, so it is only worth doing behind a long dish: where
+        cooks turn over quickly the order would have been reached soon anyway."""
         if self.TOUCH_RATIO <= 0.0:
             return
-        floor = self.TOUCH_RATIO * max(1, switch_cost)
+        floor = self.TOUCH_RATIO * max(1, obs.kitchen.switch_cost)
         placed = {o for o in decision.assignments.values() if o is not None}
         fresh = [o for o in rail if not o.has_started and o.id not in placed]
-        if not fresh:
-            return
         free = obs.free_stations()
         for order_id in placed:
             order = obs.order(order_id)
             if order is not None and order.station:
                 free[order.station] = free.get(order.station, 0) - 1
         for core in obs.working_cores:
-            if not fresh or core.id in decision.assignments:
+            if not fresh:
+                break
+            if core.id in decision.assignments:
                 continue
             current = obs.order_on(core)
             if current is None or not current.has_started:
                 continue
             if self._burst(obs, current) < floor:
                 continue                    # this cook is free again soon
-            if core.station:
-                free[core.station] = free.get(core.station, 0) + 1
-            for index, candidate in enumerate(fresh):
-                station = candidate.station
-                if station is not None and free.get(station, 0) <= 0:
-                    continue
-                decision.assign(core, candidate)
-                if station is not None:
-                    free[station] -= 1
-                fresh.pop(index)
-                break
-            else:
-                if core.station:
-                    free[core.station] = free.get(core.station, 0) - 1
+            self._hand_over(decision, core, fresh, free)
 
     # -- the decision -------------------------------------------------------
 
     def schedule(self, obs):
         self._wait_means = {}
         self._bursts = {}
-        switch_cost = obs.kitchen.switch_cost
 
         scored = []
         doomed_ids = []
         for order in obs.ready:
-            cost, doomed = self._cost(obs, order, switch_cost)
+            cost, doomed = self._cost(obs, order)
             scored.append((cost, order.id, order))
             if doomed:
                 doomed_ids.append(order.id)
@@ -362,17 +443,22 @@ class MiseEnPlace(Scheduler):
         rail = [row[2] for row in scored]
 
         decision = Decision()
+        alarms = []
         starved = bool(rail) and self._event_starved(obs)
         rotating = starved and self._should_rotate(obs, rail)
         if rotating:
             self._rotate(obs, decision, rail)
         else:
-            self._fill(obs, decision, rail)
-            self._touch(obs, decision, rail, switch_cost)
-        if starved and rail:
+            if self._fill(obs, decision, rail):
+                # Back once the switch is paid and the tick is banked.
+                alarms.append(obs.kitchen.switch_cost + 1)
+            self._touch(obs, decision, rail)
+        if starved:
             # Nothing else is going to ask us, so the alarm is the only way back
             # in - whether that is to look at somebody new or to pass a cook on.
-            decision.wake_in(self.ROTATE_QUANTUM)
+            alarms.append(self.ROTATE_QUANTUM)
+        if alarms:
+            decision.wake_in(min(alarms))
 
         note = "slicing" if rotating else "running out"
         return decision.annotate(

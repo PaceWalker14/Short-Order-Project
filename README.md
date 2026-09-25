@@ -88,9 +88,17 @@ well. So while the rail is long, the biggest dishes sit out and wait for a
 lull. They can't be stranded there — the moment a cook has nothing else to
 pick up, the hold comes off and the banquet goes on.
 
-**Never interrupt.** Taking a cook off a half-finished dish costs twice — once
-to switch away, once to come back. Tempting in theory, measurably worse in
-practice. Every version that preempted scored below the one that didn't.
+**Look at everyone early.** The clock on "response" stops at an order's first
+tick of work, and it runs just as hard for a banquet as for an espresso. So an
+order nobody has started gets a small nudge up the rail, and a free cook on its
+way to its next order first stops at the longest-waiting long dish nobody has
+touched, gives it one tick, and moves on. Three ticks of a cook's time bank a
+wait that would otherwise have run for a hundred.
+
+**Otherwise, don't interrupt.** Taking a cook off a half-finished dish costs
+twice — once to switch away, once to come back. Apart from those first ticks,
+a cook is only ever pulled off a dish when it is buried in a very long one and
+somebody new has been left unlooked-at.
 
 **Watch the doorways.** Only so many cooks fit at the pass or the bar. An order
 sent to a full station just bounces back, so the scheduler checks there is
